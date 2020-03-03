@@ -11,6 +11,7 @@
 # ----------------------------------------------------------------------------
 
 import os
+import re
 import shutil
 import subprocess
 
@@ -64,6 +65,11 @@ class TensorFlowSwiftAPIs(product.Product):
         target = ''
         if host_target.startswith('macosx'):
             target = '-DCMAKE_Swift_COMPILER_TARGET=x86_64-apple-macosx10.13'
+        if self.args.enable_x10:
+            x10_inc = os.path.join(self.install_toolchain_path(), 'usr', 'lib',
+                                   'swift', 'x10', 'include')
+        else:
+            x10_inc = ''
         # SWIFT_ENABLE_TENSORFLOW END
 
         with shell.pushd(self.build_dir):
@@ -85,6 +91,7 @@ class TensorFlowSwiftAPIs(product.Product):
                 '-D', 'CMAKE_Swift_FLAGS={}'.format('-L{}'.format(
                     os.path.join(tensorflow_source_dir, 'bazel-bin', 'tensorflow'))
                 ),
+                '-D', 'X10_INCLUDE_DIR={}'.format(x10_inc),
                 # SWIFT_ENABLE_TENSORFLOW END
                 '-B', self.build_dir,
                 '-S', self.source_dir,
@@ -136,6 +143,36 @@ def _symlink(dest, src):
     os.symlink(dest, src)
 
 
+# Remove the first components of a path.
+def _remove_first_path_components(root, prefix_len):
+    return os.path.sep.join(root.split(os.path.sep)[prefix_len:])
+
+
+# Translate given path to destination.
+def _translate_path(root, dest, prefix_len):
+    return os.path.join(dest, _remove_first_path_components(root, prefix_len))
+
+
+def _copy_x10_headers(source, dest, name_pattern):
+    try:
+        os.makedirs(dest)
+    except OSError:
+        pass
+    prefix_len = len(os.path.normpath(source).split(os.path.sep))
+    for root, dirs, files in os.walk(source, topdown=True, followlinks=True):
+        for d in dirs:
+            dest_subdir = _translate_path(root, dest, prefix_len)
+            try:
+                os.mkdir(os.path.join(dest_subdir, d))
+            except OSError:
+                pass
+    for root, dirs, files in os.walk(source, topdown=True, followlinks=True):
+        for f in files:
+            if name_pattern is None or re.match(name_pattern, f):
+                dest_subdir = _translate_path(root, dest, prefix_len)
+                shutil.copy(os.path.join(root, f), dest_subdir)
+
+
 class TensorFlow(product.Product):
     @classmethod
     def product_source_name(cls):
@@ -152,6 +189,17 @@ class TensorFlow(product.Product):
         return self.args.build_tensorflow_swift_apis
 
     def build(self, host_target):
+        if self.args.enable_x10:
+            _symlink(os.path.join(self.source_dir, '..',
+                                  'tensorflow-swift-apis', 'Sources', 'x10',
+                                  'xla_tensor'),
+                     os.path.join(self.source_dir, 'tensorflow', 'compiler',
+                                  'tf2xla', 'xla_tensor'))
+            _symlink(os.path.join(self.source_dir, '..',
+                                  'tensorflow-swift-apis', 'Sources', 'x10',
+                                  'xla_client'),
+                     os.path.join(self.source_dir, 'tensorflow', 'compiler',
+                                  'xla', 'xla_client'))
         with shell.pushd(self.source_dir):
             # Run the TensorFlow configure script: `yes "" | ./configure`.
             # NOTE: consider rewriting `subprocess` API usages using `shell`
@@ -161,13 +209,17 @@ class TensorFlow(product.Product):
                                   stdin=yes_process.stdout)
             yes_process.terminate()
 
+            if self.args.enable_x10:
+                bazel_target = "//tensorflow/compiler/tf2xla/xla_tensor:libx10.so"
+            else:
+                bazel_target = "//tensorflow:tensorflow"
             # Build TensorFlow via bazel.
             shell.call([
                 self.toolchain.bazel,
                 "build",
                 "-c", "opt",
                 "--define", "framework_shared_object=false",
-                "//tensorflow:tensorflow",
+                bazel_target,
             ])
 
         # bazel builds libraries with version suffixes, e.g.
@@ -178,10 +230,17 @@ class TensorFlow(product.Product):
             _get_tensorflow_library(host_target)
 
         # NOTE: ignore the race condition here ....
-        _symlink(os.path.join(self.source_dir, 'bazel-bin', 'tensorflow',
-                              suffixed_lib_name),
-                 os.path.join(self.source_dir, 'bazel-bin', 'tensorflow',
-                              unsuffixed_lib_name))
+        if self.args.enable_x10:
+            _symlink(os.path.join(self.source_dir, 'bazel-bin', 'tensorflow',
+                                  'compiler', 'tf2xla', 'xla_tensor',
+                                  'libx10.so'),
+                     os.path.join(self.source_dir, 'bazel-bin', 'tensorflow',
+                                  unsuffixed_lib_name))
+        else:
+            _symlink(os.path.join(self.source_dir, 'bazel-bin', 'tensorflow',
+                                  suffixed_lib_name),
+                     os.path.join(self.source_dir, 'bazel-bin', 'tensorflow',
+                                  unsuffixed_lib_name))
 
     def should_test(self, host_target):
         return False
@@ -191,6 +250,34 @@ class TensorFlow(product.Product):
 
     def should_install(self, host_target):
         return self.args.build_tensorflow_swift_apis
+
+    def _collect_headers(self):
+        x10_inc = os.path.join(self.install_toolchain_path(), 'usr', 'lib',
+                               'swift', 'x10', 'include')
+        _silenced(shutil.rmtree)(x10_inc)
+        _copy_x10_headers(os.path.join(self.source_dir, 'bazel-tensorflow'),
+                          x10_inc, r'.*\.h$')
+        _copy_x10_headers(os.path.join(self.source_dir, 'bazel-bin'), x10_inc,
+                          r'.*\.h$')
+        _copy_x10_headers(os.path.join(self.source_dir, 'bazel-tensorflow',
+                                       'external', 'com_google_protobuf',
+                                       'src'),
+                          x10_inc, r'(.*\.inc$|.*\.h)$')
+        _copy_x10_headers(os.path.join(self.source_dir, 'bazel-tensorflow',
+                                       'external', 'com_google_absl'),
+                          x10_inc, r'(.*\.inc$|.*\.h)$')
+        _copy_x10_headers(os.path.join(self.source_dir, 'bazel-tensorflow',
+                                       'external', 'eigen_archive', 'Eigen'),
+                          os.path.join(x10_inc, 'Eigen'), None)
+        _copy_x10_headers(os.path.join(self.source_dir, 'third_party',
+                                       'eigen3'),
+                          os.path.join(x10_inc, 'third_party', 'eigen3'), None)
+        _copy_x10_headers(os.path.join(self.source_dir, 'bazel-tensorflow',
+                                       'external', 'eigen_archive',
+                                       'unsupported'),
+                          os.path.join(x10_inc, 'unsupported'), None)
+        _silenced(shutil.rmtree)(os.path.join(x10_inc, 'external'))
+        _silenced(shutil.rmtree)(os.path.join(x10_inc, 'bazel-out'))
 
     def install(self, host_target):
         (suffixed_lib_name, unsuffixed_lib_name) = \
@@ -208,17 +295,31 @@ class TensorFlow(product.Product):
         _silenced(os.unlink)(os.path.join(self.install_toolchain_path(),
                                           'usr', 'lib', 'swift', subdir,
                                           suffixed_lib_name))
+        if self.args.enable_x10:
+            _silenced(os.unlink)(os.path.join(self.install_toolchain_path(),
+                                              'usr', 'lib', 'swift', subdir,
+                                              'libx10.so'))
         _silenced(os.makedirs)(os.path.join(self.install_toolchain_path(),
                                             'usr', 'lib', 'swift', subdir))
-        shutil.copy(os.path.join(self.source_dir, 'bazel-bin', 'tensorflow',
-                                 suffixed_lib_name),
-                    os.path.join(self.install_toolchain_path(),
-                                 'usr', 'lib', 'swift',
-                                 subdir, suffixed_lib_name))
+        if self.args.enable_x10:
+            shutil.copy(os.path.join(self.source_dir, 'bazel-bin',
+                                     'tensorflow', 'compiler', 'tf2xla',
+                                     'xla_tensor', 'libx10.so'),
+                        os.path.join(self.install_toolchain_path(),
+                                     'usr', 'lib', 'swift',
+                                     subdir, 'libx10.so'))
+            lib_name = 'libx10.so'
+        else:
+            shutil.copy(os.path.join(self.source_dir, 'bazel-bin',
+                                     'tensorflow', suffixed_lib_name),
+                        os.path.join(self.install_toolchain_path(),
+                                     'usr', 'lib', 'swift',
+                                     subdir, suffixed_lib_name))
+            lib_name = suffixed_lib_name
         # Add write permissions to `libtensorflow.{dylib,so}`.  This is required
         # for symbol stripping and code signing.
         os.chmod(os.path.join(self.install_toolchain_path(),
-                              'usr', 'lib', 'swift', subdir, suffixed_lib_name),
+                              'usr', 'lib', 'swift', subdir, lib_name),
                  0o755)
 
         if host_target.startswith('linux'):
@@ -228,6 +329,12 @@ class TensorFlow(product.Product):
                 'libtensorflow.so.2',
                 'libtensorflow.so',
             )
+
+            if self.args.enable_x10:
+                _symlink('libx10.so',
+                         os.path.join(self.install_toolchain_path(),
+                                      'usr', 'lib', 'swift', subdir,
+                                      versions[0]))
         else:
             versions = (
                 'libtensorflow.2.1.0.dylib',
@@ -270,5 +377,8 @@ class TensorFlow(product.Product):
                                      'CTensorFlow', name),
                         os.path.join(self.install_toolchain_path(),
                                      'usr', 'lib', 'swift', 'tensorflow', name))
+
+        if self.args.enable_x10:
+            self._collect_headers()
 
 # SWIFT_ENABLE_TENSORFLOW END
